@@ -1,5 +1,7 @@
 # claude-sessions
 
+**Languages:** **English** · [한국어](README.ko.md)
+
 > Browse, search, resume, back up, and relocate every local Claude Code session from your terminal.
 
 `claude-sessions` is a single-file Python CLI that indexes every session transcript Claude Code has ever written under `~/.claude/projects/`, then gives you an interactive `fzf`-style picker and a set of subcommands to manage them.
