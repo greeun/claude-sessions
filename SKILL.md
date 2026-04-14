@@ -45,6 +45,7 @@ A curses TUI. Use for all multi-session browsing tasks; do not dump large lists 
 - `↑↓` / `Ctrl-P/N` — move
 - `PgUp` / `PgDn` / `Home` / `End` — page / jump
 - *letters* — live filter (session id + cwd + first message; single keyword only, since Space is reserved)
+- `/` — full-text search across every session's transcript; type query + `Enter` to run, `Esc` to cancel, empty query + `Enter` to clear. Supports OR via `|` and is case-insensitive. Matched rows show the hit snippet in place of the first message
 - `Backspace` / `Ctrl-U` — edit / clear filter
 - `Space` — toggle mark on current row (multi-select)
 - `Ctrl-X` — clear all marks

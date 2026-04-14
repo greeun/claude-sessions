@@ -6,7 +6,7 @@ Each line of a .jsonl file is one event. We only index user/assistant messages.
 """
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 import argparse
 import json
@@ -483,6 +483,84 @@ def cmd_resume(args: argparse.Namespace) -> int:
     return 0
 
 
+def _tui_search_prompt(stdscr, initial: str = "") -> str | None:
+    """Bottom-line editable prompt for full-text search. Returns None on Esc,
+    or the (possibly empty) query on Enter."""
+    import curses
+    h, w = stdscr.getmaxyx()
+    buf = initial
+    curses.curs_set(1)
+    try:
+        while True:
+            line = f" / {buf}"
+            try:
+                stdscr.addnstr(h - 1, 0, line.ljust(w - 1), w - 1,
+                               curses.color_pair(2) | curses.A_BOLD)
+                cx = min(w - 1, len(line))
+                stdscr.move(h - 1, cx)
+                stdscr.refresh()
+            except curses.error:
+                pass
+            ch = stdscr.getch()
+            if ch == 27:  # Esc — cancel
+                return None
+            if ch in (10, 13):  # Enter — accept (may be empty)
+                return buf
+            if ch in (curses.KEY_BACKSPACE, 127, 8):
+                buf = buf[:-1]
+            elif ch == 21:  # ^U — clear
+                buf = ""
+            elif 32 <= ch < 127:
+                buf += chr(ch)
+    finally:
+        curses.curs_set(0)
+
+
+def _tui_run_search(stdscr, sessions: list[SessionMeta], query: str) -> dict[str, str] | None:
+    """Scan every session's JSONL for the query. Returns {session_id: snippet}
+    or None if the user cancelled with Esc."""
+    import curses
+    regex = compile_query(query, case_insensitive=True)
+    hits: dict[str, str] = {}
+    h, w = stdscr.getmaxyx()
+    total = len(sessions)
+    stdscr.nodelay(True)
+    try:
+        for i, s in enumerate(sessions, 1):
+            try:
+                ch = stdscr.getch()
+                if ch == 27:
+                    return None
+            except curses.error:
+                pass
+            if i == 1 or i == total or i % 5 == 0:
+                msg = f" Searching {i}/{total}…  (Esc to cancel) "
+                try:
+                    stdscr.addnstr(h - 1, 0, msg.ljust(w - 1), w - 1,
+                                   curses.color_pair(2) | curses.A_BOLD)
+                    stdscr.refresh()
+                except curses.error:
+                    pass
+            try:
+                for evt in iter_jsonl(s.path):
+                    if evt.get("type") not in ("user", "assistant"):
+                        continue
+                    text = extract_text((evt.get("message") or {}).get("content"))
+                    if not text:
+                        continue
+                    m = regex.search(text)
+                    if m:
+                        start = max(0, m.start() - 40)
+                        end = min(len(text), m.end() + 80)
+                        hits[s.session_id] = text[start:end].replace("\n", " ")
+                        break
+            except OSError:
+                continue
+        return hits
+    finally:
+        stdscr.nodelay(False)
+
+
 def _pick_ui(stdscr, sessions: list[SessionMeta]):
     import curses
     curses.curs_set(0)
@@ -504,13 +582,19 @@ def _pick_ui(stdscr, sessions: list[SessionMeta]):
     top = 0
     marked: set[str] = set()
     toast: str = ""
+    search_query: str = ""
+    search_hits: dict[str, str] | None = None  # None = search not active
 
     def filtered() -> list[SessionMeta]:
+        if search_hits is not None:
+            pool = [s for s in sessions if s.session_id in search_hits]
+        else:
+            pool = sessions
         if not query:
-            return sessions
+            return pool
         q = query.lower()
         out = []
-        for s in sessions:
+        for s in pool:
             hay = f"{s.session_id} {s.cwd} {s.first_user_msg}".lower()
             if q in hay:
                 out.append(s)
@@ -567,8 +651,12 @@ def _pick_ui(stdscr, sessions: list[SessionMeta]):
             top = sel
 
         mark_hint = f"  ✓{len(marked)}" if marked else ""
-        header = (f" claude-sessions v{__version__}  {len(items)}/{len(sessions)}{mark_hint}"
-                  "   ↑↓ move  PgUp/PgDn page  Enter open  Space mark  Del delete  Esc quit ")
+        search_hint = (
+            f"  🔎 {search_query!r}→{len(search_hits)}"
+            if search_hits is not None else ""
+        )
+        header = (f" claude-sessions v{__version__}  {len(items)}/{len(sessions)}{mark_hint}{search_hint}"
+                  "   ↑↓ move  Enter open  Space mark  / search  Del delete  Esc quit ")
         col_header = f"   {'LAST ACTIVITY':<16}  {'SESSION':<8}  {'MSGS':>6}  MESSAGE"
         try:
             stdscr.addnstr(0, 0, header.ljust(w), w, curses.color_pair(2) | curses.A_BOLD)
@@ -594,7 +682,10 @@ def _pick_ui(stdscr, sessions: list[SessionMeta]):
             is_sel = idx == sel
             is_marked = s.session_id in marked
             mark = "●" if is_marked else " "
-            tail_raw = s.first_user_msg or "(no user msg)"
+            if search_hits is not None and s.session_id in search_hits:
+                tail_raw = search_hits[s.session_id]
+            else:
+                tail_raw = s.first_user_msg or "(no user msg)"
             tail = truncate(tail_raw, max(20, w - 38))
             line = f" {mark} {ts}  {sid}  [{s.msg_count:>4}]  {tail}"
             if is_sel:
@@ -695,6 +786,26 @@ def _pick_ui(stdscr, sessions: list[SessionMeta]):
             top = 0
         elif ch == 24:  # ^X — clear all marks
             marked.clear()
+        elif ch == ord('/'):  # full-text search across all session transcripts
+            q = _tui_search_prompt(stdscr, initial=search_query)
+            if q is None:
+                pass  # cancelled — keep previous search state
+            elif q == "":
+                search_query = ""
+                search_hits = None
+                sel = 0
+                top = 0
+                toast = "Search cleared"
+            else:
+                result = _tui_run_search(stdscr, sessions, q)
+                if result is None:
+                    toast = "Search cancelled"
+                else:
+                    search_query = q
+                    search_hits = result
+                    sel = 0
+                    top = 0
+                    toast = f"Search: {len(result)} session(s) matched"
         elif 33 <= ch < 127:  # printable (excluding space, which is mark)
             query += chr(ch)
             sel = 0
